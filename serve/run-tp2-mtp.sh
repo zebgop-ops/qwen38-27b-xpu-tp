@@ -19,9 +19,19 @@ export LD_LIBRARY_PATH=$VIRTUAL_ENV/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 export VLLM_XPU_FP8_BLOCK_TO_CHANNEL=${VLLM_XPU_FP8_BLOCK_TO_CHANNEL:-1}
 # Patch 0003: FP8 LM head. ~+2% decode, +0.6 GiB/rank KV. Set 0 to keep the checkpoint's bf16 lm_head.
 export VLLM_XPU_LMHEAD_FP8=${VLLM_XPU_LMHEAD_FP8:-1}
-# Patch 0004: graph-capturable all-reduce/all-gather (symmetric memory + P2P). This is what makes
-# XPU graphs work under TP. Disable together with graphs: VLLM_XPU_SYMM_AR=0 QWEN38_GRAPHS=0.
-export VLLM_XPU_SYMM_AR=${VLLM_XPU_SYMM_AR:-1}
+# XPU graphs + TP need oneCCL >= 2022.1.2 (make-patched-tree.sh installs it). torch 2.14 pins
+# 2022.1.1, which records broken collectives into graphs: output is silent garbage. On an older
+# oneCCL, fall back to patch 0004 (graph-capturable collectives via symmetric memory + P2P), which
+# is just as fast. Force either way with VLLM_XPU_SYMM_AR=0/1.
+CCL_VER=$(python -c "import importlib.metadata as m; print(m.version('oneccl'))" 2>/dev/null)
+if [ -z "$VLLM_XPU_SYMM_AR" ]; then
+  if python -c "import sys; v=tuple(map(int,'$CCL_VER'.split('.')[:3])); sys.exit(v < (2022,1,2))" 2>/dev/null; then
+    export VLLM_XPU_SYMM_AR=0
+  else
+    echo "WARNING: oneCCL '$CCL_VER' < 2022.1.2 cannot be recorded into XPU graphs; using VLLM_XPU_SYMM_AR=1" >&2
+    export VLLM_XPU_SYMM_AR=1
+  fi
+fi
 # Patch 0001 (VLLM_XPU_ISOLATE_WORKERS=1 + CCL_TOPO_P2P_ACCESS=0) is only for compute-runtime < 26.35
 # and is incompatible with 0004 (no P2P between isolated workers). Leave it off.
 

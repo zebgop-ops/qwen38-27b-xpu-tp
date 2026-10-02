@@ -25,7 +25,7 @@ multi-device GTT mirror.
    (6.3 vs 8.9 GB/s); small all-reduces stay at 46 µs.
 2. **compute-runtime 26.35.39758.10 fixes it in userspace**: 2 × 4 GiB with both
    GPUs visible costs 200 MiB. Production uses 26.35 without 0001, because
-   0004 needs P2P between ranks.
+   isolation costs bandwidth and the 0004 fallback needs P2P between ranks.
 
 Caveat: there is a separate kernel-side issue, xe dma-buf export populating
 the TT, reported on kernel 7.0 even with 26.35. Its fix is unmerged. We didn't
@@ -101,11 +101,35 @@ C=8. So the step time was fixed overhead, not compute or bandwidth:
 The 46 µs floor is oneCCL's SYCL-kernel path over PCIe. Disabling SYCL kernels
 falls back to 175 µs.
 
-## 8. oneCCL inside XPU graphs: two failure modes
+## 8. oneCCL inside XPU graphs: broken on 2022.1.1, fixed in 2022.1.2
+
+**Root cause (found after §9–10, verified end to end):** the installed oneCCL
+was too old. `torch==2.14.0+xpu` pins `oneccl==2022.1.1`, so a from-source
+`requirements/xpu.txt` install gets 2022.1.1, and 2022.1.1 can't record
+collectives into a SYCL graph. vLLM's `docker/Dockerfile.xpu` installs 2022.1.2
+over torch's pin, so the official image works. On the same box,
+`tools/ccl_graph_test.py` (64 chained all-reduces plus an all-gather, captured)
+gives:
+
+| oneCCL | Capture | Replay | In-graph cost per collective |
+|---|---|---|---|
+| 2022.1.1 | `ext_oneapi_get_graph()` error | wrong | – |
+| 2022.1.1 + `CCL_SYCL_{ALLREDUCE,ALLGATHERV}_SIMPLE_THRESHOLD=4294967296` | same error | wrong | – |
+| **2022.1.2** (defaults) | OK | **correct** | **16.2 µs** |
+| 2022.1.2 + the SIMPLE thresholds | OK | correct | 16.4 µs |
+
+End to end on Qwen3.8-27B with graphs and MTP k=3, stock oneCCL 2022.1.2 and
+patch 0004 on 2022.1.1 match within noise:
+- 87.8 / 64.2 vs 87.0 / 64.2 tok/s single-stream;
+- 372 / 540 vs 371 / 542 tok/s at C8 / C16;
+- GSM8K 95% for both.
+
+Production now runs stock oneCCL 2022.1.2. Patch 0004 is a fallback that the
+launcher enables automatically on an older oneCCL. The rest of this section
+describes the 2022.1.1 behaviour.
 
 torch's `XPUGraph` records into a **SYCL graph**: the capture stream's queue
-goes into `ext_oneapi` recording state. oneCCL submits to its own queue. What
-happened:
+goes into `ext_oneapi` recording state. What happened with 2022.1.1:
 - **Small dense model (Qwen3-0.6B):** capture throws `onecclAllReduce caught
   std::exception: ext_oneapi_get_graph() can only be called on recording
   queues`, and the engine dies.
@@ -127,9 +151,11 @@ the next captured piece reads the address recorded at capture time. Attention
 works as a split point only because its ops write into preallocated outputs
 (`*_with_output`).
 
-## 9. The fix: symmetric-memory collectives during capture (patch 0004)
+## 9. Workaround for oneCCL 2022.1.1: symmetric-memory collectives during capture (patch 0004)
 
-torch 2.14's `XPUSymmetricMemory` provides Level Zero IPC buffers, peer
+This was built before the oneCCL version was identified as the cause (§8). It
+still works and is just as fast, so it stays as a fallback for stacks that can't
+override torch's pin. torch 2.14's `XPUSymmetricMemory` provides Level Zero IPC buffers, peer
 pointers (`get_buffer(peer)`), and **device-side `barrier` / `put_signal` /
 `wait_signal` implemented as SYCL kernels**. It ships no collective ops for
 XPU, but an all-reduce can be built from those pieces.
@@ -171,11 +197,13 @@ drafter, and specific to TP.
 **Root cause.** The V2 runner's `AutoRegressiveSpeculator.capture()` records
 the draft prefill as one FULL graph: model forward + `compute_logits` + sample.
 `compute_logits` gathers the vocab-parallel LM-head output with an all-gather
-inherited from `DeviceCommunicatorBase`. That's still oneCCL, so it got
-recorded broken, and every draft came from garbage logits. The target model
+inherited from `DeviceCommunicatorBase`. That's still oneCCL (2022.1.1), so it
+got recorded broken, and every draft came from garbage logits. The target model
 computes its logits outside its graph, which is why its outputs were
 unaffected. Routing `all_gather` and `gather` through the symmetric buffer
 during capture gave normal acceptance (3.26 at k=5) and 93.8 / 62.3 tok/s.
+With oneCCL 2022.1.2 the oneCCL all-gather records correctly too, so none of
+this applies there.
 
 ## 11. One-off copy-engine fault at startup, and the watchdog
 

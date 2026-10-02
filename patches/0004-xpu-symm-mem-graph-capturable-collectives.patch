@@ -1,15 +1,19 @@
 XPU: graph-capturable TP collectives via torch symmetric memory
-(VLLM_XPU_SYMM_AR=1).
+(VLLM_XPU_SYMM_AR=1). FALLBACK for oneCCL < 2022.1.2.
 
-oneCCL collectives cannot be recorded into XPU (SYCL) graphs: capture either
-fails ("ext_oneapi_get_graph() can only be called on recording queues") or
-silently records a broken graph. While a graph is being captured, all_reduce,
-all_gather and gather instead stage the input in a torch XPUSymmetricMemory
-buffer, synchronize with device-side barrier kernels and read the peers'
-buffers over P2P -- all ordinary recordable kernels (~16 us per all-reduce on
-replay vs ~46 us for oneCCL eager). Eager calls (large prefills) keep oneCCL.
-all_gather/gather matter for MTP: the drafter's FULL prefill graph includes
-compute_logits, whose vocab-parallel gather otherwise poisons every draft.
+oneCCL 2022.1.1 (the version torch==2.14.0+xpu pins) cannot record
+collectives into XPU (SYCL) graphs: capture either fails ("ext_oneapi_get_graph()
+can only be called on recording queues") or silently records a broken graph.
+oneCCL 2022.1.2 records correctly; use that when you can (it is what vLLM's
+docker/Dockerfile.xpu installs). This patch is for stacks stuck on 2022.1.1.
+
+While a graph is being captured, all_reduce, all_gather and gather stage the
+input in a torch XPUSymmetricMemory buffer, synchronize with device-side
+barrier kernels and read the peers' buffers over P2P -- ordinary recordable
+kernels, ~16 us per all-reduce on replay (same as oneCCL 2022.1.2 in-graph).
+Eager calls keep oneCCL. all_gather/gather matter for MTP: the drafter's FULL
+prefill graph includes compute_logits, whose vocab-parallel gather otherwise
+poisons every draft.
 
 diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/distributed/device_communicators/xpu_communicator.py
 index 7a5913754f..dbce19e74e 100644

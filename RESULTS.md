@@ -6,9 +6,10 @@ Model: **Qwen/Qwen3.8-27B-FP8**, the official block-FP8 checkpoint, at
 Hardware: 2× Intel Arc Pro B70 (32 GB) on one bifurcated PCIe Gen4 x8/x8 slot,
 Ryzen 9 3950X, 30 GiB RAM, Ubuntu 26.04 / kernel 7.0.
 
-Production config: TP=2, MTP `num_speculative_tokens=3`, patches 0002+0003+0004,
-XPU graphs (`FULL_AND_PIECEWISE`, `max_cudagraph_capture_size=64`),
-`gpu_memory_utilization=0.93`, compute-runtime 26.35.
+Production config: TP=2, MTP `num_speculative_tokens=3`, patches 0002+0003,
+**oneCCL 2022.1.2** (patch 0004 off), XPU graphs (`FULL_AND_PIECEWISE`,
+`max_cudagraph_capture_size=64`), `gpu_memory_utilization=0.93`,
+compute-runtime 26.35.
 
 All numbers come from `tools/bench.py`:
 - temperature 0, thinking off, 512 generated tokens with `ignore_eos`;
@@ -20,7 +21,11 @@ All numbers come from `tools/bench.py`:
 Run-to-run noise is ±5% on single-stream decode, because MTP acceptance varies
 with tiny numeric differences.
 
-## Production (graphs + symm collectives, MTP k=3)
+## Production (XPU graphs, MTP k=3)
+
+The full table below was measured with patch 0004 on oneCCL 2022.1.1. Stock
+oneCCL 2022.1.2 with 0004 off, the current production setup, matches it within
+noise; see *oneCCL version* below.
 
 | | |
 |---|---|
@@ -85,7 +90,25 @@ Eager, isolated, runtime 26.31, async scheduling, for comparison:
 
 `--async-scheduling` made no difference (50.8 vs 51.6).
 
-## Graphs: the failure modes and the fix (MTP k=5 unless noted)
+## oneCCL version: 2022.1.1 vs 2022.1.2 under XPU graphs
+
+All rows use XPU graphs, MTP k=3, patches 0002+0003, and shared (non-isolated) workers.
+
+| | oneCCL 2022.1.1 + patch 0004 | **oneCCL 2022.1.2, no 0004** | oneCCL 2022.1.1, no 0004 |
+|---|---|---|---|
+| Output | correct | correct | **garbage** |
+| GSM8K | 95% | 95% | – |
+| C1 code / prose | 87.0 / 64.2 | 87.8 / 64.2 | – |
+| C4 / C8 / C16 | 221 / 371 / 542 | 223 / 372 / 540 | – |
+| Prefill 7k / 27k | 2,240 / 2,098 | 2,225 / 2,095 | – |
+| Decode @27k | 74.7 | 73.0 | – |
+| In-graph collective (`tools/ccl_graph_test.py`, `symm_allreduce_graph_test.py`) | 16.4 µs | 16.2 µs | capture error |
+
+Forcing oneCCL's "simple" SYCL algorithms with
+`CCL_SYCL_{ALLREDUCE,ALLGATHERV}_SIMPLE_THRESHOLD=4294967296`
+doesn't fix 2022.1.1 and doesn't change 2022.1.2 (16.4 µs).
+
+## Graphs on oneCCL 2022.1.1: the failure modes and the fallback fix (MTP k=5 unless noted)
 
 | Config | Output | Acceptance | C1 code / prose |
 |---|---|---|---|
@@ -150,7 +173,8 @@ same as the activation quantization it removes.
 
 ## Collectives
 
-`tools/ccl_latency.py` and `tools/symm_allreduce_graph_test.py`:
+`tools/ccl_latency.py` and `tools/symm_allreduce_graph_test.py`. The eager
+oneCCL rows were measured on oneCCL 2022.1.1:
 
 | | 10 KiB | 1 MiB | 16 MiB |
 |---|---|---|---|

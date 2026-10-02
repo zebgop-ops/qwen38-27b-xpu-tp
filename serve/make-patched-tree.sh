@@ -16,4 +16,8 @@ uv venv -q --python 3.12 "$QWEN38_VENV"
 source "$QWEN38_VENV/bin/activate"
 uv pip install -q -r requirements/xpu.txt --index-strategy unsafe-best-match
 VLLM_TARGET_DEVICE=xpu uv pip install -q --no-build-isolation -e .
-python -c "import torch, vllm; print('vllm', vllm.__version__, 'torch', torch.__version__, 'xpus', torch.xpu.device_count())"
+# torch 2.14.0+xpu pins oneccl==2022.1.1, which cannot be recorded into XPU graphs (TP + graphs =
+# silent garbage). Override to 2022.1.2 like vLLM's docker/Dockerfile.xpu does (FINDINGS §8).
+# Must run after the vLLM install, which re-resolves torch's pin.
+uv pip install -q "oneccl==2022.1.2" "oneccl-devel==2022.1.2"
+python -c "import torch, vllm, importlib.metadata as m; print('vllm', vllm.__version__, 'torch', torch.__version__, 'oneccl', m.version('oneccl'), 'xpus', torch.xpu.device_count())"
