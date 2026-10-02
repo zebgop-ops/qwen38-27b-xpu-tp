@@ -1,0 +1,92 @@
+XPU: run block-FP8 checkpoints on the weight-only W8A16 kernel
+(VLLM_XPU_FP8_BLOCK_TO_CHANNEL=1).
+
+At load time, dequantize each block-scaled FP8 weight and requantize it to
+per-output-channel FP8, then serve it with fp8_gemm_w8a16 (bf16 activations)
+instead of dynamic-activation W8A8 fp8_gemm. On Arc Pro B70 the W8A16 kernel
+is ~2x faster at every batch size (M=1..2048) and accuracy is equal (weight
+requant error ~= the activation-quant error it replaces).
+
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/xpu.py b/vllm/model_executor/kernels/linear/scaled_mm/xpu.py
+index 92d6458bb3..70f680299b 100644
+--- a/vllm/model_executor/kernels/linear/scaled_mm/xpu.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/xpu.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import math
++import os
+ from collections.abc import Sequence
+ 
+ import torch
+@@ -119,6 +120,9 @@ class XPUW8A8FP8LinearKernel(FP8ScaledMMLinearKernel):
+         return output.view(*output_shape)
+ 
+ 
++_BLOCK_TO_CHANNEL = os.environ.get("VLLM_XPU_FP8_BLOCK_TO_CHANNEL") == "1"
++
++
+ class XPUW8A16FP8LinearKernel(FP8ScaledMMLinearKernel):
+     @classmethod
+     def is_supported(
+@@ -199,6 +203,9 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
+         return True, None
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module):
++        if _BLOCK_TO_CHANNEL and not getattr(layer, "is_bmm", False):
++            self._convert_to_channel_w8a16(layer)
++            return
+         super().process_weights_after_loading(layer)
+         scale_attr = (
+             "weight_scale_inv" if hasattr(layer, "weight_scale_inv") else "weight_scale"
+@@ -264,6 +271,50 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
+             0, 2, 1
+         )  # [G, K, N_per_group]
+ 
++    # b70 local patch (VLLM_XPU_FP8_BLOCK_TO_CHANNEL=1): requantize block-FP8
++    # weights to per-output-channel FP8 at load time and run the weight-only
++    # fp8_gemm_w8a16 kernel (bf16 activations). On Arc Pro B70 this is ~2x
++    # faster than dynamic-act W8A8 block fp8_gemm at every batch size, with
++    # equal accuracy (weight requant error ~= activation quant error).
++    @torch.no_grad()
++    def _convert_to_channel_w8a16(self, layer: torch.nn.Module) -> None:
++        params = self._get_layer_params(layer)
++        w, bscale = params.weight, params.block_scale
++        bn, bk = self.weight_group_shape
++        N, K = w.shape
++        fp8 = w.dtype
++        fmax = torch.finfo(fp8).max
++        new_w = torch.empty_like(w)
++        new_s = torch.empty(N, dtype=torch.float32, device=w.device)
++        step = 2048
++        for n0 in range(0, N, step):
++            n1 = min(N, n0 + step)
++            rows = torch.arange(n0, n1, device=w.device) // bn
++            srow = bscale.float().index_select(0, rows)  # [n, k_blocks]
++            wf = w[n0:n1].float() * srow.repeat_interleave(bk, 1)[:, :K]
++            cs = wf.abs().amax(1).clamp(min=1e-12) / fmax
++            new_w[n0:n1] = (wf / cs[:, None]).clamp(-fmax, fmax).to(fp8)
++            new_s[n0:n1] = cs
++        replace_parameter(layer, params.WEIGHT, new_w.t())  # [K, N] view
++        replace_parameter(layer, params.block_scale_attr, new_s.view(1, N))
++        layer._xpu_w8a16_scale_attr = params.block_scale_attr
++
++    def apply_weights(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++        **kwargs,
++    ) -> torch.Tensor:
++        scale_attr = getattr(layer, "_xpu_w8a16_scale_attr", None)
++        if scale_attr is None:
++            return super().apply_weights(layer, x, bias, **kwargs)
++        w = layer.weight
++        out = torch.ops._xpu_C.fp8_gemm_w8a16(
++            x.reshape(-1, x.shape[-1]), w, getattr(layer, scale_attr), bias
++        )
++        return out.to(self.config.out_dtype).view(*x.shape[:-1], w.shape[1])
++
+     def apply_block_scaled_mm(
+         self,
+         A: torch.Tensor,

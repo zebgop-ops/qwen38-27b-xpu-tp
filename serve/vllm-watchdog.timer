@@ -1,0 +1,11 @@
+# Install: sudo cp vllm-watchdog.sh /usr/local/bin/ && sudo cp vllm-watchdog.{service,timer} /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now vllm-watchdog.timer
+[Unit]
+Description=Check vllm-qwen38 health every 2 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

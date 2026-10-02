@@ -1,0 +1,5 @@
+# Keep Intel GPUs out of runtime suspend / D3cold. On a bifurcated (x8/x8) B550I slot the second B70
+# failed to resume ("Force wake domain ... failed to ack wake (-ETIMEDOUT)", "runtime resume failed")
+# about 10 minutes after boot and stayed dead until reboot.
+# Install: sudo cp 80-intel-gpu-no-runtime-pm.rules /etc/udev/rules.d/ && reboot
+ACTION=="add|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x8086", ATTR{class}=="0x030000", ATTR{power/control}="on", ATTR{d3cold_allowed}="0"

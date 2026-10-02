@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart vllm-qwen38 if it is active but not serving
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vllm-watchdog.sh

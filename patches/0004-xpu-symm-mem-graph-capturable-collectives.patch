@@ -1,0 +1,165 @@
+XPU: graph-capturable TP collectives via torch symmetric memory
+(VLLM_XPU_SYMM_AR=1).
+
+oneCCL collectives cannot be recorded into XPU (SYCL) graphs: capture either
+fails ("ext_oneapi_get_graph() can only be called on recording queues") or
+silently records a broken graph. While a graph is being captured, all_reduce,
+all_gather and gather instead stage the input in a torch XPUSymmetricMemory
+buffer, synchronize with device-side barrier kernels and read the peers'
+buffers over P2P -- all ordinary recordable kernels (~16 us per all-reduce on
+replay vs ~46 us for oneCCL eager). Eager calls (large prefills) keep oneCCL.
+all_gather/gather matter for MTP: the drafter's FULL prefill graph includes
+compute_logits, whose vocab-parallel gather otherwise poisons every draft.
+
+diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/distributed/device_communicators/xpu_communicator.py
+index 7a5913754f..dbce19e74e 100644
+--- a/vllm/distributed/device_communicators/xpu_communicator.py
++++ b/vllm/distributed/device_communicators/xpu_communicator.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
++
+ import torch
+ import torch.distributed as dist
+ from torch.distributed import ProcessGroup
+@@ -14,6 +16,56 @@ from .base_device_communicator import DeviceCommunicatorBase
+ logger = init_logger(__name__)
+ 
+ 
++class _XpuSymmAllReduce:
++    """b70 local patch (VLLM_XPU_SYMM_AR=1): graph-capturable all-reduce.
++
++    oneCCL collectives cannot be recorded into XPU (SYCL) graphs. During graph
++    capture we instead stage the input in a torch symmetric-memory buffer,
++    sync with device-side barriers (SYCL kernels) and sum the peers' buffers
++    via P2P loads, so the whole all-reduce is ordinary recordable kernels.
++    """
++
++    def __init__(self, group: ProcessGroup, device: torch.device, max_bytes: int):
++        import torch.distributed._symmetric_memory as symm_mem
++
++        self.max_bytes = max_bytes
++        self.buf = symm_mem.empty(max_bytes, dtype=torch.uint8, device=device)
++        self.hdl = symm_mem.rendezvous(self.buf, group.group_name)
++        self.world_size = self.hdl.world_size
++        self.bufs = [
++            self.hdl.get_buffer(i, (max_bytes,), torch.uint8)
++            for i in range(self.world_size)
++        ]
++        self.local = self.bufs[self.hdl.rank]
++
++    def fits(self, x: torch.Tensor) -> bool:
++        nbytes = x.numel() * x.element_size()
++        return x.is_contiguous() and nbytes <= self.max_bytes and nbytes % 4 == 0
++
++    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
++        n, dt = x.numel(), x.dtype
++        self.local.view(dt)[:n].copy_(x.reshape(-1))
++        self.hdl.barrier(channel=0)
++        # Same summation order on every rank -> bit-identical results.
++        out = self.bufs[0].view(dt)[:n] + self.bufs[1].view(dt)[:n]
++        for i in range(2, self.world_size):
++            out += self.bufs[i].view(dt)[:n]
++        self.hdl.barrier(channel=1)  # peers done reading before buffer reuse
++        return out.view_as(x)
++
++    def all_gather(self, x: torch.Tensor, dim: int) -> torch.Tensor:
++        n, dt = x.numel(), x.dtype
++        self.local.view(dt)[:n].copy_(x.reshape(-1))
++        self.hdl.barrier(channel=0)
++        out = torch.cat([b.view(dt)[:n].view(x.shape) for b in self.bufs], dim=dim)
++        self.hdl.barrier(channel=1)
++        return out
++
++
++def _capturing() -> bool:
++    return torch.xpu.is_current_stream_capturing()
++
++
+ class XpuCommunicator(DeviceCommunicatorBase):
+     def __init__(
+         self,
+@@ -27,6 +79,18 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             cpu_group, device, device_group, unique_name, use_all2all=use_all2all
+         )
+         self.ca_comm: None = None
++        self.symm_ar: _XpuSymmAllReduce | None = None
++        if (
++            os.environ.get("VLLM_XPU_SYMM_AR") == "1"
++            and self.world_size > 1
++            and device_group is not None
++        ):
++            max_mb = int(os.environ.get("VLLM_XPU_SYMM_AR_MAX_MB", "64"))
++            self.symm_ar = _XpuSymmAllReduce(device_group, self.device, max_mb << 20)
++            logger.info(
++                "XPU symmetric-memory all-reduce enabled for graph capture "
++                "(%s, %d MiB buffer).", unique_name, max_mb,
++            )
+         if self.use_all2all:
+             if self.all2all_backend in ("naive", "allgather_reducescatter"):
+                 from .all2all import AgRsAll2AllManager
+@@ -65,11 +129,32 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             # and accumulate in rank order, independent of the token batch.
+             return self._fixed_rank_sum(input_)
+ 
++        if self.symm_ar is not None and _capturing():
++            if self.symm_ar.fits(input_):
++                return self.symm_ar.all_reduce(input_)
++            logger.warning_once(
++                "all_reduce of %s %s during XPU graph capture does not fit the "
++                "symmetric buffer; falling back to oneCCL (not capturable).",
++                tuple(input_.shape), input_.dtype,
++            )
+         output = input_.clone()
+         dist.all_reduce(output, group=self.device_group)
+         return output
+ 
++    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
++        if self.symm_ar is not None and _capturing():
++            if self.symm_ar.fits(input_.contiguous()):
++                return self.symm_ar.all_gather(input_.contiguous(), dim)
++            logger.warning_once(
++                "all_gather of %s during XPU graph capture does not fit the "
++                "symmetric buffer; falling back to oneCCL (not capturable).",
++                tuple(input_.shape),
++            )
++        return super().all_gather(input_, dim)
++
+     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
++        if self.symm_ar is not None and _capturing():
++            logger.warning_once("reduce_scatter called during XPU graph capture (oneCCL, not capturable)")
+         world_size = self.world_size
+ 
+         if dim < 0:
+@@ -158,6 +243,8 @@ class XpuCommunicator(DeviceCommunicatorBase):
+         dim: int = 0,
+         sizes: list[int] | None = None,
+     ):
++        if self.symm_ar is not None and _capturing():
++            logger.warning_once("all_gatherv called during XPU graph capture (oneCCL, not capturable)")
+         if dim != 0:
+             raise NotImplementedError("only dim 0 all-gatherv is supported")
+         world_size = self.world_size
+@@ -209,6 +296,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
+     def gather(
+         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
+     ) -> torch.Tensor | None:
++        if self.symm_ar is not None and _capturing():
++            if self.symm_ar.fits(input_.contiguous()):
++                full = self.symm_ar.all_gather(input_.contiguous(), dim)
++                return full if self.rank_in_group == dst else None
++            logger.warning_once("gather called during XPU graph capture (oneCCL, not capturable)")
+         assert -input_.dim() <= dim < input_.dim(), (
+             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+         )
+@@ -237,6 +329,8 @@ class XpuCommunicator(DeviceCommunicatorBase):
+         return output_tensor
+ 
+     def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
++        if self.symm_ar is not None and _capturing():
++            logger.warning_once("broadcast called during XPU graph capture (oneCCL, not capturable)")
+         dist.broadcast(input_, src=src, group=self.device_group)
+ 
+     def dispatch_router_logits(

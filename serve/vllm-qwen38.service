@@ -1,0 +1,21 @@
+# Install: replace USER, then
+#   sudo cp vllm-qwen38.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now vllm-qwen38
+[Unit]
+Description=vLLM Qwen3.8-27B-FP8 (2x Arc Pro B70, TP2, XPU graphs) on :8000
+After=network-online.target cpu-performance.service
+Wants=network-online.target
+
+[Service]
+User=USER
+Group=USER
+SupplementaryGroups=render video
+WorkingDirectory=/home/USER
+ExecStart=/home/USER/qwen38-27b-xpu-tp/serve/run-tp2-mtp.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=900
+KillMode=control-group
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

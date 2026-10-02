@@ -1,0 +1,8 @@
+# Install: sudo cp cpu-performance.service /etc/systemd/system/ && sudo systemctl enable --now cpu-performance
+[Unit]
+Description=Set CPU governor to performance (LLM serving latency)
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "for c in /sys/devices/system/cpu/cpu*/cpufreq; do echo performance > $c/scaling_governor; done"
+[Install]
+WantedBy=multi-user.target

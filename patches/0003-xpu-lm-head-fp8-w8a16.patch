@@ -1,0 +1,60 @@
+XPU: FP8 LM head (VLLM_XPU_LMHEAD_FP8=1).
+
+Stores ParallelLMHead weights as per-row FP8 and runs them with
+fp8_gemm_w8a16. Halves the LM-head bytes read per step (it also runs once per
+MTP draft step) and frees ~0.6 GiB/rank for KV cache.
+
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index be20c41243..bde9f30ad4 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -4,6 +4,8 @@
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ from torch.nn.parameter import Parameter
+@@ -64,6 +66,28 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+         set_weight_attrs(weight, extra_weight_attrs)
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        # b70 local patch (VLLM_XPU_LMHEAD_FP8=1): store the LM head as
++        # per-row FP8 and run it with the weight-only fp8_gemm_w8a16 kernel.
++        if (
++            os.environ.get("VLLM_XPU_LMHEAD_FP8") == "1"
++            and current_platform.is_xpu()
++            and isinstance(layer, ParallelLMHead)
++            and getattr(layer, "_w8a16_scale", None) is None
++        ):
++            with torch.no_grad():
++                w = layer.weight.data
++                fp8 = torch.float8_e4m3fn
++                fmax = torch.finfo(fp8).max
++                wq = torch.empty(w.shape, dtype=fp8, device=w.device)
++                cs = torch.empty(w.shape[0], dtype=torch.float32, device=w.device)
++                for r0 in range(0, w.shape[0], 8192):
++                    blk = w[r0 : r0 + 8192].float()
++                    sc = blk.abs().amax(1).clamp(min=1e-12) / fmax
++                    wq[r0 : r0 + 8192] = (blk / sc[:, None]).clamp(-fmax, fmax).to(fp8)
++                    cs[r0 : r0 + 8192] = sc
++            layer.weight = Parameter(wq, requires_grad=False)
++            layer._w8a16_scale = cs.view(1, -1)
++            return
+         if current_platform.is_cpu():
+             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
+ 
+@@ -79,6 +103,11 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+             current_platform.is_cuda_alike() or current_platform.is_xpu()
+         ):
+             return linear_batch_invariant(x, layer.weight, bias)
++        if getattr(layer, "_w8a16_scale", None) is not None:
++            out = torch.ops._xpu_C.fp8_gemm_w8a16(
++                x.reshape(-1, x.shape[-1]), layer.weight.t(), layer._w8a16_scale, bias
++            )
++            return out.view(*x.shape[:-1], layer.weight.shape[0])
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+ 
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

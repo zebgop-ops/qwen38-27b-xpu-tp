@@ -1,0 +1,118 @@
+XPU: one GPU per TP worker (VLLM_XPU_ISOLATE_WORKERS=1).
+
+Spawns each worker with ZE_AFFINITY_MASK=<its device> so every process gets a
+single-device Level Zero context, and maps the worker/process-group device to
+xpu:0. Works around the 1:1 host-RAM mirror of every device allocation that
+compute-runtime 26.09-26.31 creates for multi-device contexts
+(intel/compute-runtime#980). Requires CCL_TOPO_P2P_ACCESS=0. Not needed on
+compute-runtime >= 26.35, and not compatible with 0004 (no P2P).
+
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index 88bb3d7c5a..dd22cdfd66 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -24,6 +24,7 @@ If you only need to use the distributed environment without model/pipeline
+ """
+ 
+ import contextlib
++import os
+ import gc
+ import pickle
+ import weakref
+@@ -533,7 +534,11 @@ class GroupCoordinator:
+             )
+             self.device = torch.device(f"cuda:{visible_device_index}")
+         elif current_platform.is_xpu():
+-            self.device = torch.device(f"xpu:{self.device_index}")
++            self.device = torch.device(
++                "xpu:0"
++                if os.environ.get("VLLM_XPU_ISOLATE_WORKERS") == "1"
++                else f"xpu:{self.device_index}"
++            )
+         elif current_platform.is_out_of_tree():
+             self.device = torch.device(
+                 f"{current_platform.device_name}:{self.device_index}"
+diff --git a/vllm/distributed/stateless_coordinator.py b/vllm/distributed/stateless_coordinator.py
+index 40957aac3e..f3df6c1a06 100644
+--- a/vllm/distributed/stateless_coordinator.py
++++ b/vllm/distributed/stateless_coordinator.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import socket
+ import struct
+ from typing import Any, Optional
+@@ -176,7 +177,11 @@ class StatelessGroupCoordinator(GroupCoordinator):
+             )
+             self.device = torch.device(f"cuda:{visible_device_index}")
+         elif current_platform.is_xpu():
+-            self.device = torch.device(f"xpu:{self.device_index}")
++            self.device = torch.device(
++                "xpu:0"
++                if os.environ.get("VLLM_XPU_ISOLATE_WORKERS") == "1"
++                else f"xpu:{self.device_index}"
++            )
+         elif current_platform.is_out_of_tree():
+             self.device = torch.device(
+                 f"{current_platform.device_name}:{self.device_index}"
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index 78290d25ba..14ab416050 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -744,10 +744,25 @@ class WorkerProc:
+         )
+ 
+         # Apply NUMA binding if configured
+-        with numa_utils.configure_subprocess(
+-            vllm_config, local_rank, process_kind="worker"
+-        ):
+-            proc.start()
++        # b70 local patch: VLLM_XPU_ISOLATE_WORKERS=1 gives each worker a
++        # single-device Level Zero context (avoids the multi-device host-RAM
++        # mirror, intel/compute-runtime#980).
++        _iso = os.environ.get("VLLM_XPU_ISOLATE_WORKERS") == "1"
++        _saved_mask = os.environ.get("ZE_AFFINITY_MASK")
++        if _iso:
++            _ids = _saved_mask.split(",") if _saved_mask else None
++            os.environ["ZE_AFFINITY_MASK"] = _ids[local_rank] if _ids else str(local_rank)
++        try:
++            with numa_utils.configure_subprocess(
++                vllm_config, local_rank, process_kind="worker"
++            ):
++                proc.start()
++        finally:
++            if _iso:
++                if _saved_mask is None:
++                    os.environ.pop("ZE_AFFINITY_MASK", None)
++                else:
++                    os.environ["ZE_AFFINITY_MASK"] = _saved_mask
+ 
+         # Close child ends of pipes here in the parent
+         ready_writer.close()
+diff --git a/vllm/v1/worker/xpu_worker.py b/vllm/v1/worker/xpu_worker.py
+index f7539d2c20..34eafb3ca6 100644
+--- a/vllm/v1/worker/xpu_worker.py
++++ b/vllm/v1/worker/xpu_worker.py
+@@ -150,6 +150,8 @@ class XPUWorker(Worker):
+                         " exceeds assigned_physical_gpu_ids count "
+                         f"({len(assigned_physical_gpu_ids)})"
+                     )
++            elif os.environ.get("VLLM_XPU_ISOLATE_WORKERS") == "1":
++                pass
+             else:
+                 assert self.local_rank < torch.accelerator.device_count(), (
+                     f"DP adjusted local rank {self.local_rank} is out of "
+@@ -157,7 +159,11 @@ class XPUWorker(Worker):
+                 )
+ 
+             visible_device_index = (
+-                current_platform.logical_device_id_to_visible_device_id(self.local_rank)
++                0
++                if os.environ.get("VLLM_XPU_ISOLATE_WORKERS") == "1"
++                else current_platform.logical_device_id_to_visible_device_id(
++                    self.local_rank
++                )
+             )
+             self.device = torch.device(f"xpu:{visible_device_index}")
+             torch.accelerator.set_device_index(self.device)
